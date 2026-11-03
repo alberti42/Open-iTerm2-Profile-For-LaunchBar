@@ -1,0 +1,212 @@
+name: Build, Notarize and Draft Release
+
+# Triggered when a vX.Y.Z or vX.Y.Z-beta.N tag is pushed (created by bin/bump_version.sh).
+# A -beta.N tag creates a draft pre-release.
+# Pipeline:
+#   1. Build the action with bin/build_actions.sh: compile the stub executable
+#      universal (arm64 + x86_64), sign the .lbaction bundle with the Developer ID
+#      Application certificate, and pack Open-iTerm2-Profile-For-LaunchBar.zip
+#   2. Notarize Open-iTerm2-Profile-For-LaunchBar.zip with Apple. stapler refuses an .lbaction bundle, so
+#      Gatekeeper fetches the ticket online when the action is first opened.
+#   3. Attest build provenance for the ZIP (Sigstore, verifiable with gh attestation verify)
+#   4. Create a draft GitHub release with the ZIP attached
+#
+# Publishing the draft is a manual step on GitHub. verify-release.yml then
+# checks the published ZIP.
+#
+# Secrets (repository settings > Secrets and variables > Actions):
+#   DEVELOPER_ID_CERTIFICATE_P12       base64 of the exported .p12 (certificate + private key)
+#   DEVELOPER_ID_CERTIFICATE_PASSWORD  password of the .p12
+#   NOTARIZATION_APPLE_ID              Apple ID of the developer account
+#   NOTARIZATION_TEAM_ID               team ID, e.g. 9V3X7C8VCK
+#   NOTARIZATION_PASSWORD              app-specific password for notarytool
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+
+jobs:
+  release:
+    runs-on: macos-26
+    permissions:
+      contents: write           # needed to create the release
+      id-token: write           # needed by actions/attest to request a Sigstore certificate
+      attestations: write       # needed by actions/attest to store the attestation
+      artifact-metadata: write  # needed by actions/attest to create the artifact storage record
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────────
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # ── Version info ──────────────────────────────────────────────────────────
+      - name: Extract version info
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"                          # e.g. v1.1.0 or v1.1.0-beta.1
+          SHORT="${TAG#v}"                                  # e.g. 1.1.0 or 1.1.0-beta.1
+          BASE="${SHORT%%-*}"                               # e.g. 1.1.0
+          if [[ "$SHORT" == *-* ]]; then PRERELEASE=true; else PRERELEASE=false; fi
+          # bin/bump_version.sh writes the version into the Info.plist before tagging.
+          for PLIST in Actions/*.lbaction/Contents/Info.plist; do
+            V=$(plutil -extract CFBundleVersion raw "$PLIST")
+            if [[ "$V" != "$BASE" ]]; then
+              echo "ERROR: tag $TAG does not match CFBundleVersion $V in $PLIST"
+              exit 1
+            fi
+          done
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "zip=build/Open-iTerm2-Profile-For-LaunchBar.zip" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Version ${SHORT}"
+
+      - name: Show toolchain
+        run: xcodebuild -version
+
+      # ── Code-signing certificate ──────────────────────────────────────────────
+      - name: Import Developer ID certificate into temporary keychain
+        env:
+          P12_BASE64:   ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          KC="$RUNNER_TEMP/build.keychain-db"
+          KC_PASS="ci-keychain"   # ephemeral, only lives for this job
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"    # 6-hour timeout
+          security unlock-keychain -p "$KC_PASS" "$KC"
+
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+
+          security list-keychain -d user -s "$KC"
+          # Allow codesign to use the key without a passphrase prompt.
+          security set-key-partition-list \
+            -S "apple-tool:,apple:,codesign:" -s -k "$KC_PASS" "$KC"
+
+      # ── Build and sign ────────────────────────────────────────────────────────
+      - name: Build and sign the action
+        env:
+          TEAM_ID: ${{ secrets.NOTARIZATION_TEAM_ID }}
+        run: |
+          bin/build_actions.sh "Developer ID Application: Andrea Alberti ($TEAM_ID)"
+
+      # ── Notarize ──────────────────────────────────────────────────────────────
+      - name: Notarize with Apple
+        env:
+          APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          TEAM_ID:  ${{ secrets.NOTARIZATION_TEAM_ID }}
+          APP_PASS: ${{ secrets.NOTARIZATION_PASSWORD }}
+          ZIP:      ${{ steps.ver.outputs.zip }}
+        run: |
+          # Submit and wait (typically 2-10 minutes)
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id  "$TEAM_ID" \
+            --password "$APP_PASS" \
+            --wait --output-format json | tee "$RUNNER_TEMP/notary.json"
+          STATUS=$(plutil -extract status raw "$RUNNER_TEMP/notary.json")
+          ID=$(plutil -extract id raw "$RUNNER_TEMP/notary.json")
+          # The log lists every item Apple issued a ticket for (ticketContents).
+          xcrun notarytool log "$ID" \
+            --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PASS"
+          if [[ "$STATUS" != "Accepted" ]]; then
+            echo "ERROR: notarization status $STATUS"
+            exit 1
+          fi
+
+          # Confirm Apple serves the ticket for each stub executable.
+          for EXE in build/Actions/*.lbaction/Contents/MacOS/*; do
+            codesign --verify --strict --check-notarization -R="notarized" --verbose "$EXE"
+          done
+
+      # Gatekeeper checks the .lbaction bundle when you double-click it.
+      # stapler refuses an .lbaction ("Stapler is incapable of working with
+      # Folder files"), so Gatekeeper fetches the bundle's ticket online.
+      - name: Check that Gatekeeper accepts the action
+        run: |
+          for BUNDLE in build/Actions/*.lbaction; do
+            codesign --verify --strict --check-notarization -R="notarized" --verbose "$BUNDLE"
+            # --type open: what Gatekeeper checks when you double-click the action.
+            # --type execute answers "does not seem to be an app" for an .lbaction.
+            OUT=$(spctl --assess --type open --context context:primary-signature --verbose=4 "$BUNDLE" 2>&1 || true)
+            echo "$OUT"
+            echo "$OUT" | grep -q "source=Notarized Developer ID"
+          done
+
+      # When a check fails, keep the built ZIP for inspection (7 days).
+      - name: Upload the ZIP after a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Actions-failed-build
+          path: build/Open-iTerm2-Profile-For-LaunchBar.zip
+          retention-days: 7
+
+      # ── Build provenance ──────────────────────────────────────────────────────
+      # Records a signed SLSA provenance statement: this ZIP (by its SHA-256) was
+      # built by this workflow, from this commit and tag. To verify a downloaded ZIP:
+      #   gh attestation verify Open-iTerm2-Profile-For-LaunchBar.zip --repo alberti42/Open-iTerm2-Profile-For-LaunchBar
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.ver.outputs.zip }}
+
+      # ── Draft release ─────────────────────────────────────────────────────────
+      - name: Resolve previous tag
+        id: prev
+        run: |
+          # The nearest tag before this one in the history. A release skips
+          # pre-release tags, so its comparison covers its pre-releases too;
+          # a pre-release compares against the previous tag of either kind.
+          # Empty for the first tag.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          else
+            PREV=$(git describe --tags --abbrev=0 --exclude '*-*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          fi
+          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "Previous tag: ${PREV:-none}"
+
+      - name: Build release notes
+        env:
+          PREV_TAG: ${{ steps.prev.outputs.tag }}
+          CURR_TAG: ${{ steps.ver.outputs.tag }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # The notes are this version's CHANGELOG.md section; a pre-release uses
+          # [Unreleased], where its changes stay until the release. They end with
+          # the compare link, which lists the commits since the previous tag.
+          SHORT="${CURR_TAG#v}"
+          if [[ "$SHORT" == *-* ]]; then SECTION=Unreleased; else SECTION="$SHORT"; fi
+          ENTRY=$(python3 bin/changelog.py section "$SECTION" || true)
+          if [[ -n "$PREV_TAG" ]]; then
+            LINK="**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${CURR_TAG}"
+          else
+            LINK="**Full Changelog**: https://github.com/${REPO}/commits/${CURR_TAG}"
+          fi
+          {
+            if [[ -n "$ENTRY" ]]; then printf '%s\n\n' "$ENTRY"; fi
+            printf '%s\n' "$LINK"
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG:      ${{ steps.ver.outputs.tag }}
+          ZIP:      ${{ steps.ver.outputs.zip }}
+          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+        run: |
+          PRERELEASE_FLAG=()
+          [[ "$PRERELEASE" == true ]] && PRERELEASE_FLAG=(--prerelease)
+          gh release create "$TAG" \
+            --draft "${PRERELEASE_FLAG[@]}" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$ZIP"

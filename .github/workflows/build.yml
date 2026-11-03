@@ -1,0 +1,41 @@
+name: Build
+
+# Builds the action, signed ad hoc, on every push to main and every pull
+# request, and runs its script once. Needs no secrets.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: xcodebuild -version
+
+      - name: Build the action
+        run: bin/build_actions.sh
+
+      - name: Check the action
+        run: |
+          BUNDLE="build/Actions/Open iTerm2 Profile.lbaction"
+          EXE="$BUNDLE/Contents/MacOS/OpenITerm2Profile"
+          lipo -archs "$EXE" | grep -q arm64
+          lipo -archs "$EXE" | grep -q x86_64
+          codesign --verify --strict --deep "$BUNDLE"
+          test -x "$BUNDLE/Contents/Scripts/default.py"
+          test -x "$BUNDLE/Contents/Scripts/open_profile.py"
+          osadecompile "$BUNDLE/Contents/Scripts/iterm2_launcher.scpt"
+          # The runner has no iTerm2 preferences; the script prints one item
+          # that says so.
+          OUT=$("$BUNDLE/Contents/Scripts/default.py")
+          echo "$OUT"
+          test "$OUT" = '[{"title": "iTerm2 preferences not found", "icon": "com.googlecode.iterm2"}]'
